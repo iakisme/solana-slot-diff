@@ -220,31 +220,25 @@ func listen(wg *sync.WaitGroup, ch chan *update, seenMap map[int]*entryInfo) {
 		).Set(float64(recv.recvTime.UnixNano()) / 1e6)
 
 		// Calculate and record time differences between endpoints
-		var fastestEndpoint string
-		var fastestTime time.Time
-
-		// 首先确定最快的endpoint
-		for endpoint, timeReceived := range seen.endpointTimes {
-			if fastestTime.IsZero() || timeReceived.Before(fastestTime) {
-				fastestTime = timeReceived
-				fastestEndpoint = endpoint
-			}
-		}
-
-		// 然后记录所有其他endpoint与最快endpoint的时间差
-		for endpoint, timeReceived := range seen.endpointTimes {
-			if endpoint == fastestEndpoint {
+		for otherEndpoint, otherTime := range seen.endpointTimes {
+			if otherEndpoint == recv.source {
 				continue
 			}
 
-			// 计算时间差（总是正值，因为fastestTime一定是最早的）
-			timeDifference := timeReceived.Sub(fastestTime).Milliseconds()
-
-			slotTimeDifferenceMetric.WithLabelValues(
-				strconv.Itoa(slotNum),
-				fastestEndpoint,
-				endpoint,
-			).Set(float64(timeDifference))
+			timeDifference := recv.recvTime.Sub(otherTime).Milliseconds()
+			if timeDifference >= 0 {
+				slotTimeDifferenceMetric.WithLabelValues(
+					strconv.Itoa(slotNum),
+					otherEndpoint,
+					recv.source,
+				).Set(float64(timeDifference))
+			} else {
+				slotTimeDifferenceMetric.WithLabelValues(
+					strconv.Itoa(slotNum),
+					recv.source,
+					otherEndpoint,
+				).Set(float64(-timeDifference))
+			}
 		}
 	}
 }
@@ -688,4 +682,3 @@ func checkThatConnectionSuccessfullyEstablished(response []byte) error {
 
 	return fmt.Errorf("error from RPC: %v", rpcError)
 }
-
