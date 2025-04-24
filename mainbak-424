@@ -7,10 +7,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -22,17 +20,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
-
-	// ==== 新增 gRPC 相关依赖 ====
-	"crypto/x509"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
-
-	// 引入生成的 proto 包，路径请根据你的 module 名称调整
-	proto "solana_compare/proto"
 )
 
 type endpointNumType int
@@ -47,8 +34,6 @@ type connType string
 const (
 	solanaNode  connType = "node"
 	blxrGateway connType = "blxr"
-	// ==== 新增 grpc 类型 ====
-	solanaGrpc connType = "grpc"
 )
 
 type solanaSlot struct {
@@ -72,7 +57,6 @@ type update struct {
 	source              string
 	rawBlock            []byte
 	recvTime            time.Time
-	grpcSlot            uint64
 	solanaMessageUpdate solanaSlot
 }
 
@@ -139,22 +123,6 @@ var (
 		},
 		[]string{"slot", "endpoint_fastest", "endpoint_compared"},
 	)
-
-	// ==== 新增 gRPC slot 接收时间指标 ====
-	grpcSlotReceiveTimeMetric = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "solana_grpc_slot_receive_time",
-			Help: "Receive time for solana slots via gRPC by endpoint",
-		},
-		[]string{"slot", "endpoint"},
-	)
-
-	// ==== gRPC Keepalive 参数 ====
-	kacp = keepalive.ClientParameters{
-		Time:                10 * time.Second,
-		Timeout:             time.Second,
-		PermitWithoutStream: true,
-	}
 )
 
 func listen(wg *sync.WaitGroup, ch chan *update, seenMap map[int]*entryInfo) {
@@ -176,16 +144,14 @@ func listen(wg *sync.WaitGroup, ch chan *update, seenMap map[int]*entryInfo) {
 	slotEndpoints := make(map[int]map[string]bool)
 
 	for recv := range ch {
-		// 1) 先取 slot
-		var slotNum int
-		if recv.grpcSlot != 0 {
-			slotNum = int(recv.grpcSlot)
-		} else {
-			n, err := recv.solanaMessageUpdate.slotNum(recv.rawBlock)
-			if err != nil || n < 0 {
-				continue
-			}
-			slotNum = n
+		slotNum, err := recv.solanaMessageUpdate.slotNum(recv.rawBlock)
+		if err != nil {
+			log.Errorf("error parsing notification from: %s: %s", recv.source, err)
+			continue
+		}
+
+		if slotNum == -1 {
+			continue
 		}
 
 		// 初始化endpoint跟踪器
@@ -364,10 +330,9 @@ func dumpFile(seenMap map[int]*entryInfo, endpoints []wsEndpoint) error {
 func main() {
 	flag.Parse()
 
-	// ==== 注册 Prometheus 指标 ====
+	// Register Prometheus metrics
 	prometheus.MustRegister(slotReceiveTimeMetric)
 	prometheus.MustRegister(slotTimeDifferenceMetric)
-	prometheus.MustRegister(grpcSlotReceiveTimeMetric)
 
 	// Start Prometheus metrics server
 	go func() {
@@ -396,14 +361,13 @@ func main() {
 		endpointName := parts[2]
 
 		switch connType(connectionTypeStr) {
-		case solanaNode, blxrGateway, solanaGrpc:
+		case solanaNode, blxrGateway:
 		default:
 			log.Fatalln("invalid connection type in endpoint-ws-uris")
 		}
 
-		if !strings.HasPrefix(connectionURI, "wss:") && !strings.HasPrefix(connectionURI, "ws:") &&
-			!strings.HasPrefix(connectionURI, "grpc:") && !strings.HasPrefix(connectionURI, "http") {
-			log.Fatalln("invalid protocol in endpoint-ws-uris")
+		if !strings.HasPrefix(connectionURI, "wss:") && !strings.HasPrefix(connectionURI, "ws:") {
+			log.Fatalln("invalid WebSocket connection protocol in endpoint-ws-uris")
 		}
 
 		endpoint := wsEndpoint{
@@ -414,16 +378,8 @@ func main() {
 		wsEndpointsList = append(wsEndpointsList, endpoint)
 	}
 
-	// ==== 先为所有 gRPC 类型端点启动监控 ====
-	ch := make(chan *update, 1000)
-	for _, e := range wsEndpointsList {
-		if e.connectionType == solanaGrpc {
-			go monitorGrpc(context.Background(), e.uri, e.name, ch)
-		}
-	}
-
 	var ctx, cancel = context.WithCancel(context.Background())
-	// var ch = make(chan *update, 1000)
+	var ch = make(chan *update, 1000)
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
@@ -455,15 +411,7 @@ func main() {
 	}
 
 	var readerWG sync.WaitGroup
-	// 只为 WebSocket (node/blxr) 类型端点计数，不包括 grpc
-	wsCount := 0
-	for _, e := range wsEndpointsList {
-		if e.connectionType != solanaGrpc {
-			wsCount++
-		}
-	}
-	readerWG.Add(wsCount)
-
+	readerWG.Add(len(wsEndpointsList))
 	var listenerWG sync.WaitGroup
 	listenerWG.Add(1)
 
@@ -471,10 +419,6 @@ func main() {
 
 	connections := make([]wsConnWithEndpointInfo, 0)
 	for _, e := range wsEndpointsList {
-		// 跳过 grpc 类型，不走 WebSocket 订阅
-		if e.connectionType == solanaGrpc {
-			continue
-		}
 		conn := subscribeToFeed(e.uri, e.connectionType)
 		connWithName := wsConnWithEndpointInfo{
 			conn:         conn,
@@ -669,7 +613,6 @@ func read(
 				source:              endpointName,
 				rawBlock:            message,
 				recvTime:            time.Now(),
-				grpcSlot:            0,
 				solanaMessageUpdate: solanaSlot{},
 			}
 		}
@@ -746,96 +689,3 @@ func checkThatConnectionSuccessfullyEstablished(response []byte) error {
 	return fmt.Errorf("error from RPC: %v", rpcError)
 }
 
-// ==== 新增：根据 Scheme 生成 gRPC DialOption 列表 ====
-func getGrpcDialOptions(insecureConn bool) []grpc.DialOption {
-	var opts []grpc.DialOption
-	if insecureConn {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	} else {
-		pool, _ := x509.SystemCertPool()
-		creds := credentials.NewClientTLSFromCert(pool, "")
-		opts = append(opts, grpc.WithTransportCredentials(creds))
-	}
-	opts = append(opts, grpc.WithKeepaliveParams(kacp))
-	return opts
-}
-
-// ==== 新增：gRPC 订阅函数，持续拉取 slot 更新并上报 Prometheus ====
-func monitorGrpc(ctx context.Context, connectionURI, endpointName string, ch chan *update) {
-	u, err := url.Parse(connectionURI)
-	if err != nil {
-		log.Errorf("invalid grpc URI %s: %v", connectionURI, err)
-		return
-	}
-
-	// 根据 Scheme 判断是否使用 TLS
-	insecureConn := u.Scheme != "https"
-	host := u.Hostname()
-	port := u.Port()
-	if port == "" {
-		if insecureConn {
-			port = "80"
-		} else {
-			port = "443"
-		}
-	}
-	address := host + ":" + port
-
-	// 建立 gRPC 连接
-	conn, err := grpc.DialContext(ctx, address, getGrpcDialOptions(insecureConn)...)
-	if err != nil {
-		log.Errorf("grpc dial error for %s: %v", endpointName, err)
-		return
-	}
-	defer conn.Close()
-
-	client := proto.NewGeyserClient(conn)
-	stream, err := client.Subscribe(ctx)
-	if err != nil {
-		log.Errorf("grpc subscribe error for %s: %v", endpointName, err)
-		return
-	}
-
-	// 构造订阅请求，只关注 slot 更新
-	filter := true
-	req := &proto.SubscribeRequest{
-		Commitment: proto.CommitmentLevel(0).Enum(),
-		Slots: map[string]*proto.SubscribeRequestFilterSlots{
-			"incoming_slots": {FilterByCommitment: &filter},
-		},
-		Accounts:          make(map[string]*proto.SubscribeRequestFilterAccounts),
-		Transactions:      make(map[string]*proto.SubscribeRequestFilterTransactions),
-		Blocks:            make(map[string]*proto.SubscribeRequestFilterBlocks),
-		BlocksMeta:        make(map[string]*proto.SubscribeRequestFilterBlocksMeta),
-		AccountsDataSlice: []*proto.SubscribeRequestAccountsDataSlice{},
-	}
-	if err := stream.Send(req); err != nil {
-		log.Errorf("grpc send subscribe for %s: %v", endpointName, err)
-		return
-	}
-
-	// 持续接收更新并上报指标
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		msg, err := stream.Recv()
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			log.Errorf("grpc recv error for %s: %v", endpointName, err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		slotNum := msg.GetSlot().GetSlot()
-		now := time.Now()
-		ch <- &update{
-			source:   endpointName,
-			recvTime: now,
-			grpcSlot: slotNum,
-		}
-	}
-}
